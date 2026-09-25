@@ -45,13 +45,13 @@ var Store = {
     return JSON.parse(JSON.stringify(WORD_DATA));
   },
 
-  saveWords: function (data) { return this.set(this.KEYS.words, data); },
+  saveWords: function (data) { var ok = this.set(this.KEYS.words, data); if (ok && window.Sync) Sync.markDirty(); return ok; },
 
   getStates: function () { return this.get(this.KEYS.states, {}); },
-  saveStates: function (s) { return this.set(this.KEYS.states, s); },
+  saveStates: function (s) { var ok = this.set(this.KEYS.states, s); if (ok && window.Sync) Sync.markDirty(); return ok; },
 
   getAttempts: function () { return this.get(this.KEYS.attempts, []); },
-  saveAttempts: function (a) { return this.set(this.KEYS.attempts, a); },
+  saveAttempts: function (a) { var ok = this.set(this.KEYS.attempts, a); if (ok && window.Sync) Sync.markDirty(); return ok; },
 
   getSettings: function () {
     return this.get(this.KEYS.settings, {
@@ -59,7 +59,7 @@ var Store = {
       speechRate: 1.0
     });
   },
-  saveSettings: function (s) { return this.set(this.KEYS.settings, s); },
+  saveSettings: function (s) { var ok = this.set(this.KEYS.settings, s); if (ok && window.Sync) Sync.markDirty(); return ok; },
 
   getSession: function () { return this.get(this.KEYS.session, null); },
   saveSession: function (s) { return this.set(this.KEYS.session, s); },
@@ -714,6 +714,255 @@ var Session = {
 };
 
 /* ================================================================
+ * 云同步（手机/PC 学习记录同步）
+ * 原理：学习记录打包存到 GitHub 私有仓库 taotao-english-data
+ *       双端通过 GitHub API 读写同一份 progress.json
+ * 合并：attempts 按时间戳去重合并；states 由合并后 attempts 重放重建
+ * ================================================================ */
+var Sync = {
+  CONFIG_KEY: 'qs_sync_config',
+  POLL_INTERVAL: 60000,   /* 轮询间隔 60 秒 */
+  DEBOUNCE_MS: 5000,      /* 本地变更后 5 秒推送 */
+  dirty: false,
+  syncing: false,
+  applying: false,        /* 同步内部写本地，防止触发再同步 */
+  _debounceTimer: null,
+  _pollTimer: null,
+
+  getConfig: function () {
+    var c = Store.get(this.CONFIG_KEY, {});
+    return {
+      enabled: !!c.enabled,
+      user: c.user || '',
+      repo: c.repo || 'taotao-english-data',
+      token: c.token || '',
+      lastSyncAt: c.lastSyncAt || 0,
+      lastStatus: c.lastStatus || ''
+    };
+  },
+
+  saveConfig: function (cfg) {
+    Store.set(this.CONFIG_KEY, {
+      enabled: !!cfg.enabled,
+      user: (cfg.user || '').trim(),
+      repo: (cfg.repo || 'taotao-english-data').trim(),
+      token: (cfg.token || '').trim(),
+      lastSyncAt: cfg.lastSyncAt || 0,
+      lastStatus: cfg.lastStatus || ''
+    });
+  },
+
+  isReady: function () {
+    var c = this.getConfig();
+    return !!(c.enabled && c.user && c.token && c.repo);
+  },
+
+  /* 本地学习数据变更 → 延迟推送 */
+  markDirty: function () {
+    if (!this.isReady() || this.applying) return;
+    var self = this;
+    this.dirty = true;
+    clearTimeout(this._debounceTimer);
+    this._debounceTimer = setTimeout(function () { self.syncNow('auto'); }, this.DEBOUNCE_MS);
+  },
+
+  /* ---------- GitHub API ---------- */
+  _api: function (method, path, body) {
+    var cfg = this.getConfig();
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, 'https://api.github.com' + path, true);
+      xhr.setRequestHeader('Authorization', 'token ' + cfg.token);
+      xhr.setRequestHeader('Accept', 'application/vnd.github.v3+json');
+      if (body) xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var json = null;
+          try { json = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+          resolve({ status: xhr.status, json: json });
+        } else if (xhr.status === 404) {
+          resolve({ status: 404, json: null });
+        } else {
+          var msg = 'HTTP ' + xhr.status;
+          try { var j = JSON.parse(xhr.responseText); if (j && j.message) msg = j.message; } catch (e) {}
+          reject(new Error(msg));
+        }
+      };
+      xhr.onerror = function () { reject(new Error('网络错误（需可访问 api.github.com）')); };
+      xhr.send(body ? JSON.stringify(body) : null);
+    });
+  },
+
+  /* 拉取云端数据；404 视为云端无数据 */
+  pull: function () {
+    var self = this;
+    var cfg = this.getConfig();
+    return this._api('GET', '/repos/' + cfg.user + '/' + cfg.repo + '/contents/progress.json', null).then(function (r) {
+      if (r.status === 404) return { data: null, sha: null };
+      var b64 = String(r.json.content || '').replace(/\s/g, '');
+      var json = decodeURIComponent(escape(atob(b64)));
+      return { data: JSON.parse(json), sha: r.json.sha };
+    });
+  },
+
+  /* 推送数据到云端 */
+  push: function (payload, sha) {
+    var cfg = this.getConfig();
+    var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    var body = { message: 'sync ' + new Date().toISOString(), content: b64 };
+    if (sha) body.sha = sha;
+    return this._api('PUT', '/repos/' + cfg.user + '/' + cfg.repo + '/contents/progress.json', body);
+  },
+
+  /* ---------- 打包 / 合并 ---------- */
+  packLocal: function () {
+    return {
+      version: '1.0',
+      packedAt: new Date().toISOString(),
+      words: Store.getWords(),
+      attempts: Store.getAttempts(),
+      settings: Store.getSettings(),
+      states: Store.getStates()
+    };
+  },
+
+  /* attempts 去重合并（wordId+skill+ts+outcome 为唯一键），按时间排序 */
+  mergeAttempts: function (a, b) {
+    var seen = {};
+    var out = [];
+    (a || []).concat(b || []).forEach(function (x) {
+      if (!x || !x.wordId || !x.ts) return;
+      var key = x.wordId + '|' + x.skill + '|' + x.ts + '|' + x.outcome;
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push(x);
+    });
+    out.sort(function (p, q) { return p.ts - q.ts; });
+    if (out.length > 5000) out = out.slice(-5000);
+    return out;
+  },
+
+  /* words 合并：版本不匹配取本地；词条数多者为准；等量取本地 */
+  mergeWords: function (local, cloud) {
+    if (!cloud || !cloud.sets || !Array.isArray(cloud.sets)) return local;
+    if (String(cloud.version || '') !== String(local.version || '')) return local;
+    var count = function (d) {
+      var n = 0;
+      d.sets.forEach(function (s) { n += (s.words || []).length; });
+      return n;
+    };
+    return count(cloud) > count(local) ? cloud : local;
+  },
+
+  /* states 由合并后 attempts 重放重建（与实时 Skills.update 完全一致） */
+  rebuildStates: function (attempts, words) {
+    var states = {};
+    var valid = {};
+    words.sets.forEach(function (s) {
+      (s.words || []).forEach(function (w) { valid[w.id] = true; });
+    });
+    attempts.forEach(function (a) {
+      if (!valid[a.wordId]) return;
+      if (Skills.list.indexOf(a.skill) < 0) return;
+      Skills.update(states, a.wordId, a.skill, a.outcome);
+    });
+    return states;
+  },
+
+  /* ---------- 主流程 ---------- */
+  syncNow: function (mode) {
+    var self = this;
+    if (!this.isReady()) return Promise.resolve('not-ready');
+    if (this.syncing) return Promise.resolve('busy');
+    this.syncing = true;
+    return this.pull().then(function (r) {
+      var merged;
+      if (!r.data) {
+        /* 云端无数据：直接上传本地 */
+        merged = self.packLocal();
+      } else {
+        /* 云端有数据：合并双端 */
+        var local = self.packLocal();
+        var attempts = self.mergeAttempts(local.attempts, r.data.attempts);
+        var words = self.mergeWords(local.words, r.data.words);
+        merged = {
+          version: '1.0',
+          packedAt: new Date().toISOString(),
+          words: words,
+          attempts: attempts,
+          states: self.rebuildStates(attempts, words),
+          settings: local.settings
+        };
+        /* 合并结果应用到本地 */
+        self.applying = true;
+        try {
+          Store.saveWords(merged.words);
+          Store.saveAttempts(merged.attempts);
+          Store.saveStates(merged.states);
+          Store.saveSettings(merged.settings);
+        } finally { self.applying = false; }
+        /* 刷新界面（不打断进行中的训练题目，仅刷新统计与列表） */
+        if (typeof App !== 'undefined') {
+          Words.init();
+          App.updateHomeStats();
+          App.renderHomeSets();
+          App.renderBrowseList();
+          App.renderManageList();
+          App.renderReview();
+          App.renderParentReport();
+        }
+      }
+      return self.push(merged, r.sha);
+    }).then(function () {
+      self.dirty = false;
+      var c = self.getConfig();
+      c.lastSyncAt = Date.now();
+      c.lastStatus = 'ok';
+      self.saveConfig(c);
+      self.updateStatusUI();
+      if (mode === 'manual') App.toast('云同步成功');
+      return 'ok';
+    }).catch(function (err) {
+      var c = self.getConfig();
+      c.lastStatus = '失败：' + err.message;
+      self.saveConfig(c);
+      self.updateStatusUI();
+      if (mode === 'manual') App.toast('云同步失败：' + err.message);
+      return 'fail';
+    }).then(function (result) {
+      self.syncing = false;
+      return result;
+    });
+  },
+
+  /* 状态栏显示 */
+  updateStatusUI: function () {
+    var el = document.getElementById('sync-status');
+    if (!el) return;
+    var c = this.getConfig();
+    if (!c.enabled) { el.textContent = '未启用'; el.className = 'sync-status off'; return; }
+    var t = c.lastSyncAt ? new Date(c.lastSyncAt).toLocaleString() : '从未';
+    if (c.lastStatus === 'ok') { el.textContent = '已同步 · ' + t; el.className = 'sync-status ok'; }
+    else if (c.lastStatus) { el.textContent = c.lastStatus + ' · ' + t; el.className = 'sync-status fail'; }
+    else { el.textContent = '已启用，尚未同步'; el.className = 'sync-status off'; }
+  },
+
+  /* 启动自动同步：2 秒后首同步 + 定时轮询（页面可见时） */
+  startAutoSync: function () {
+    var self = this;
+    if (this._pollTimer) clearInterval(this._pollTimer);
+    if (!this.isReady()) return;
+    setTimeout(function () { if (self.isReady()) self.syncNow('auto'); }, 2000);
+    this._pollTimer = setInterval(function () {
+      if (!self.isReady() || self.syncing) return;
+      if (document.hidden) return;
+      if (self.dirty) return;
+      self.syncNow('auto');
+    }, this.POLL_INTERVAL);
+  }
+};
+
+/* ================================================================
  * 应用主控制器
  * ================================================================ */
 var App = {
@@ -750,6 +999,10 @@ var App = {
     if (hash && document.getElementById('view-' + hash)) {
       this.showView(hash);
     }
+
+    /* 启动云同步（手机/PC 学习记录同步，需在设置中启用） */
+    Sync.startAutoSync();
+    Sync.updateStatusUI();
   },
 
   /* ---------- 视图切换 ---------- */
@@ -769,6 +1022,7 @@ var App = {
     if (name === 'review') this.renderReview();
     if (name === 'parent') this.renderParentReport();
     if (name === 'manage') this.renderManageList();
+    if (name === 'settings') { this.applySettings(); this.applySyncConfigToUI(); }
   },
 
   /* ---------- 首页 ---------- */
@@ -1608,6 +1862,41 @@ var App = {
     if (Store.saveSettings(s)) this.toast('设置已保存');
   },
 
+  /* ---------- 云同步（手机/PC 学习记录同步） ---------- */
+  applySyncConfigToUI: function () {
+    var c = Sync.getConfig();
+    var elE = document.getElementById('sync-enabled');
+    if (!elE) return;
+    elE.checked = c.enabled;
+    document.getElementById('sync-user').value = c.user;
+    document.getElementById('sync-repo').value = c.repo;
+    document.getElementById('sync-token').value = c.token;
+    Sync.updateStatusUI();
+  },
+
+  saveSyncConfig: function () {
+    var c = {
+      enabled: document.getElementById('sync-enabled').checked,
+      user: document.getElementById('sync-user').value,
+      repo: document.getElementById('sync-repo').value,
+      token: document.getElementById('sync-token').value,
+      lastSyncAt: Sync.getConfig().lastSyncAt,
+      lastStatus: Sync.getConfig().lastStatus
+    };
+    if (c.enabled && (!c.user || !c.token || !c.repo)) {
+      this.toast('启用同步需要填写 GitHub 用户名、仓库名和访问令牌');
+      return;
+    }
+    Sync.saveConfig(c);
+    Sync.startAutoSync();
+    Sync.updateStatusUI();
+    this.toast('云同步配置已保存' + (c.enabled ? '，稍后自动同步' : ''));
+  },
+
+  syncNow: function () {
+    Sync.syncNow('manual');
+  },
+
   /* ---------- 数据管理 ---------- */
   exportData: function (format) {
     var data = {
@@ -1711,6 +2000,7 @@ window.Skills = Skills;
 window.Quiz = Quiz;
 window.Session = Session;
 window.TTS = TTS;
+window.Sync = Sync;
 
 /* 启动 */
 if (document.readyState === 'loading') {

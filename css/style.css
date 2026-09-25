@@ -873,6 +873,34 @@ body {
 .settings-card p { font-size: 0.9rem; color: var(--ink-light); margin-bottom: 6px; }
 .settings-card .ver { font-size: 0.8rem; color: var(--ink-lighter); margin-top: 12px; }
 
+/* ============ 云同步 ============ */
+.setting-item input[type="text"], .setting-item input[type="password"] {
+  padding: 7px 12px;
+  border: 1px solid var(--border-dark);
+  border-radius: 4px;
+  font-size: 0.9rem;
+  width: 200px;
+  max-width: 55%;
+}
+
+.sync-help {
+  font-size: 0.82rem !important;
+  color: var(--ink-lighter) !important;
+  line-height: 1.5;
+  margin-bottom: 10px;
+}
+
+.sync-status {
+  font-size: 0.88rem;
+  padding: 4px 12px;
+  border-radius: 12px;
+  display: inline-block;
+}
+
+.sync-status.ok { color: #2d7a2d; background: #e8f5e8; }
+.sync-status.off { color: var(--ink-light); background: var(--border); }
+.sync-status.fail { color: #b03a2e; background: #fdeaea; }
+
 /* ============ 按钮 ============ */
 .btn {
   padding: 10px 24px;
