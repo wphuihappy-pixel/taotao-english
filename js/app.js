@@ -1868,8 +1868,8 @@ var App = {
     var elE = document.getElementById('sync-enabled');
     if (!elE) return;
     elE.checked = c.enabled;
-    document.getElementById('sync-user').value = c.user;
-    document.getElementById('sync-repo').value = c.repo;
+    document.getElementById('sync-user').value = c.user || 'wphuihappy-pixel';
+    document.getElementById('sync-repo').value = c.repo || 'taotao-english-data';
     document.getElementById('sync-token').value = c.token;
     Sync.updateStatusUI();
   },
